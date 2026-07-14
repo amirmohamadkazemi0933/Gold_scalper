@@ -1,6 +1,6 @@
 ````markdown
 # Gold Scalper Bot (MT4)
-
+Danger :Please first Try on Demo
 A high-performance **MetaTrader 4 (MT4)** Expert Advisor built for **XAUUSD (Gold)** scalping on the **M1 (1-Minute)** timeframe.
 
 The goal of this EA is to identify high-probability trading opportunities by combining trend analysis, pullback entries, volatility filters, and strict risk management.
