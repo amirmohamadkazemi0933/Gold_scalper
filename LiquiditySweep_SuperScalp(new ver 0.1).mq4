@@ -57,6 +57,18 @@ input double TrailArmRMultiple       = 1.0;
 input bool   ShowDebugDashboard      = true;
 input bool   PrintDebugLog           = true;
 
+//---------------- Telegram monitoring ----------------
+input bool   TelegramEnabled        = false;
+input string TelegramBotToken       = "";
+input string TelegramChatID         = "";
+input bool   TelegramOpenAlerts     = true;
+input bool   TelegramCloseAlerts    = true;
+input bool   TelegramTrailingAlerts = true;
+input bool   TelegramErrorAlerts    = true;
+input bool   TelegramDailySummary   = true;
+input int    TelegramSummaryHour    = 23; // broker server hour, 0..23
+
+
 //================== REGIME CONSTANTS ==================
 #define REGIME_TRENDING 1
 #define REGIME_RANGING  2
@@ -79,6 +91,10 @@ int      rangeBarsWaited   = 0;
 double   lastRangeHigh = 0, lastRangeLow = 0;
 
 datetime lastBarTime    = 0;
+datetime telegramLastCloseTime = 0;
+int      telegramLastCloseTicket = 0;
+int      telegramSummaryDay = -1;
+
 
 //+------------------------------------------------------------------+
 int OnInit()
@@ -86,9 +102,142 @@ int OnInit()
    if(StringFind(Symbol(),"XAU") < 0)
       Print("Warning: this EA is tuned for XAUUSD. Current symbol: ", Symbol());
    lastBarTime = Time[0];
+   // Start from existing history: do not report old closed trades as new.
+   for(int h=0;h<OrdersHistoryTotal();h++)
+     {
+      if(!OrderSelect(h,SELECT_BY_POS,MODE_HISTORY)) continue;
+      if(OrderSymbol()!=Symbol() || OrderMagicNumber()!=MagicNumber) continue;
+      datetime ct=OrderCloseTime();
+      if(ct>telegramLastCloseTime || (ct==telegramLastCloseTime && OrderTicket()>telegramLastCloseTicket))
+        { telegramLastCloseTime=ct; telegramLastCloseTicket=OrderTicket(); }
+     }
+   EventSetTimer(15);
    return(INIT_SUCCEEDED);
   }
-void OnDeinit(const int reason) { }
+void OnDeinit(const int reason) { EventKillTimer(); }
+
+// URL-encode UTF-8 bytes for application/x-www-form-urlencoded POST.
+string TelegramEncode(string value)
+  {
+   uchar bytes[];
+   int n=StringToCharArray(value,bytes,0,WHOLE_ARRAY,CP_UTF8);
+   string out="";
+   for(int i=0;i<n-1;i++)
+     {
+      int b=(int)bytes[i];
+      if((b>=48 && b<=57)||(b>=65 && b<=90)||(b>=97 && b<=122)||b==45||b==46||b==95||b==126)
+         out+=CharToString((uchar)b);
+      else out+="%"+StringFormat("%02X",b);
+     }
+   return out;
+  }
+
+bool TelegramSend(string message)
+  {
+   if(!TelegramEnabled || TelegramBotToken=="" || TelegramChatID=="") return false;
+   if(IsTesting() || IsOptimization()) return false; // MT4 tester does not support WebRequest
+   string url="https://api.telegram.org/bot"+TelegramBotToken+"/sendMessage";
+   string body="chat_id="+TelegramEncode(TelegramChatID)+"&text="+TelegramEncode(message);
+   char data[],result[];
+   string headers="Content-Type: application/x-www-form-urlencoded\r\n";
+   string responseHeaders;
+   StringToCharArray(body,data,0,StringLen(body),CP_UTF8);
+   ResetLastError();
+   int status=WebRequest("POST",url,headers,5000,data,result,responseHeaders);
+   if(status!=200)
+     {
+      // Never log bot token or the full URL.
+      Print("Telegram request failed. HTTP=",status," MT4 error=",GetLastError(),
+            ". Enable https://api.telegram.org in MT4 WebRequest settings.");
+      return false;
+     }
+   return true;
+  }
+
+string TelegramSide(int orderType) { return orderType==OP_BUY?"BUY":"SELL"; }
+
+void TelegramOpened(int ticket)
+  {
+   if(!TelegramOpenAlerts || !OrderSelect(ticket,SELECT_BY_TICKET)) return;
+   string msg="OPEN "+TelegramSide(OrderType())+" "+OrderSymbol()+
+      "\nTicket: "+IntegerToString(ticket)+
+      "\nLot: "+DoubleToString(OrderLots(),2)+
+      "\nEntry: "+DoubleToString(OrderOpenPrice(),Digits)+
+      "\nSL: "+DoubleToString(OrderStopLoss(),Digits)+
+      "\nTP: "+DoubleToString(OrderTakeProfit(),Digits)+
+      "\nStrategy: "+OrderComment();
+   TelegramSend(msg);
+  }
+
+void TelegramOrderError(string side,int errorCode)
+  {
+   if(TelegramErrorAlerts)
+      TelegramSend("ORDER ERROR "+Symbol()+" "+side+"\nMT4 error: "+IntegerToString(errorCode));
+  }
+
+// Detect closures made by SL, TP, broker or manual action as well as EA actions.
+void TelegramCheckClosures()
+  {
+   datetime maxTime=telegramLastCloseTime;
+   int maxTicket=telegramLastCloseTicket;
+   for(int i=0;i<OrdersHistoryTotal();i++)
+     {
+      if(!OrderSelect(i,SELECT_BY_POS,MODE_HISTORY)) continue;
+      if(OrderSymbol()!=Symbol() || OrderMagicNumber()!=MagicNumber) continue;
+      datetime ct=OrderCloseTime(); int ticket=OrderTicket();
+      if(ct<telegramLastCloseTime || (ct==telegramLastCloseTime && ticket<=telegramLastCloseTicket)) continue;
+      if(ct>maxTime || (ct==maxTime && ticket>maxTicket)) {maxTime=ct;maxTicket=ticket;}
+      if(TelegramCloseAlerts)
+        {
+         double net=OrderProfit()+OrderSwap()+OrderCommission();
+         string msg="CLOSED "+TelegramSide(OrderType())+" "+OrderSymbol()+
+           "\nTicket: "+IntegerToString(ticket)+
+           "\nLot: "+DoubleToString(OrderLots(),2)+
+           "\nEntry: "+DoubleToString(OrderOpenPrice(),Digits)+
+           "\nExit: "+DoubleToString(OrderClosePrice(),Digits)+
+           "\nNet P/L: "+DoubleToString(net,2)+" "+AccountCurrency()+
+           "\nBalance: "+DoubleToString(AccountBalance(),2)+" "+AccountCurrency();
+         TelegramSend(msg);
+        }
+     }
+   telegramLastCloseTime=maxTime;
+   telegramLastCloseTicket=maxTicket;
+  }
+
+void TelegramCheckDailySummary()
+  {
+   if(!TelegramEnabled || !TelegramDailySummary) return;
+   datetime now=TimeCurrent();
+   if(TimeHour(now)<TelegramSummaryHour) return;
+   int today=TimeYear(now)*1000+TimeDayOfYear(now);
+   if(today==telegramSummaryDay) return;
+   datetime start=StrToTime(TimeToString(now,TIME_DATE));
+   int trades=0,wins=0,losses=0;
+   double net=0;
+   for(int i=0;i<OrdersHistoryTotal();i++)
+     {
+      if(!OrderSelect(i,SELECT_BY_POS,MODE_HISTORY)) continue;
+      if(OrderSymbol()!=Symbol() || OrderMagicNumber()!=MagicNumber || OrderCloseTime()<start) continue;
+      double p=OrderProfit()+OrderSwap()+OrderCommission();
+      net+=p; trades++;
+      if(p>0) wins++; else if(p<0) losses++;
+     }
+   string msg="DAILY REPORT "+Symbol()+" "+TimeToString(now,TIME_DATE)+
+      "\nClosed: "+IntegerToString(trades)+" (win "+IntegerToString(wins)+", loss "+IntegerToString(losses)+")"+
+      "\nNet P/L: "+DoubleToString(net,2)+" "+AccountCurrency()+
+      "\nBalance: "+DoubleToString(AccountBalance(),2)+
+      "\nEquity: "+DoubleToString(AccountEquity(),2)+
+      "\nOpen EA positions: "+IntegerToString(CountMyOrders());
+   if(TelegramSend(msg)) telegramSummaryDay=today;
+  }
+
+void OnTimer()
+  {
+   if(!TelegramEnabled) return;
+   TelegramCheckClosures();
+   TelegramCheckDailySummary();
+  }
+
 
 //+------------------------------------------------------------------+
 //| Helpers                                                            |
@@ -227,8 +376,8 @@ void TryEnterTrend()
       double tp        = Ask + stopPts*RiskRewardRatio*Point;
       double lot       = CalcLot(stopPts);
       int ticket = OrderSend(Symbol(),OP_BUY,lot,Ask,MaxSlippage,stopPrice,tp,"TrendBuy",MagicNumber,0,clrBlue);
-      if(ticket<0) Print("Buy OrderSend failed: ",GetLastError());
-      else if(PrintDebugLog) Print("TREND BUY at ",Ask," SL=",stopPrice," TP=",tp);
+      if(ticket<0) { int err=GetLastError(); Print("Buy OrderSend failed: ",err); TelegramOrderError("BUY",err); }
+       else { TelegramOpened(ticket); if(PrintDebugLog) Print("TREND BUY at ",Ask," SL=",stopPrice," TP=",tp); }
       armDirection = 0;
      }
    else if(armDirection==-1 && Bid < brkLow)
@@ -238,8 +387,8 @@ void TryEnterTrend()
       double tp        = Bid - stopPts*RiskRewardRatio*Point;
       double lot       = CalcLot(stopPts);
       int ticket = OrderSend(Symbol(),OP_SELL,lot,Bid,MaxSlippage,stopPrice,tp,"TrendSell",MagicNumber,0,clrRed);
-      if(ticket<0) Print("Sell OrderSend failed: ",GetLastError());
-      else if(PrintDebugLog) Print("TREND SELL at ",Bid," SL=",stopPrice," TP=",tp);
+      if(ticket<0) { int err=GetLastError(); Print("Sell OrderSend failed: ",err); TelegramOrderError("SELL",err); }
+       else { TelegramOpened(ticket); if(PrintDebugLog) Print("TREND SELL at ",Bid," SL=",stopPrice," TP=",tp); }
       armDirection = 0;
      }
   }
@@ -308,8 +457,8 @@ void TryEnterRange()
          double tp         = MathMin(tpRange, tpRR); // take the nearer, more conservative target
          double lot        = CalcLot(stopPts);
          int ticket = OrderSend(Symbol(),OP_BUY,lot,Ask,MaxSlippage,stopPrice,tp,"RangeBuySupport",MagicNumber,0,clrBlue);
-         if(ticket<0) Print("Buy OrderSend failed: ",GetLastError());
-         else if(PrintDebugLog) Print("RANGE BUY (support) at ",Ask," SL=",stopPrice," TP=",tp);
+         if(ticket<0) { int err=GetLastError(); Print("Buy OrderSend failed: ",err); TelegramOrderError("BUY",err); }
+       else { TelegramOpened(ticket); if(PrintDebugLog) Print("RANGE BUY (support) at ",Ask," SL=",stopPrice," TP=",tp); }
          rangeArm = 0;
         }
      }
@@ -325,8 +474,8 @@ void TryEnterRange()
          double tp         = MathMax(tpRange, tpRR);
          double lot        = CalcLot(stopPts);
          int ticket = OrderSend(Symbol(),OP_SELL,lot,Bid,MaxSlippage,stopPrice,tp,"RangeSellResistance",MagicNumber,0,clrRed);
-         if(ticket<0) Print("Sell OrderSend failed: ",GetLastError());
-         else if(PrintDebugLog) Print("RANGE SELL (resistance) at ",Bid," SL=",stopPrice," TP=",tp);
+         if(ticket<0) { int err=GetLastError(); Print("Sell OrderSend failed: ",err); TelegramOrderError("SELL",err); }
+       else { TelegramOpened(ticket); if(PrintDebugLog) Print("RANGE SELL (resistance) at ",Bid," SL=",stopPrice," TP=",tp); }
          rangeArm = 0;
         }
      }
